@@ -29,6 +29,7 @@ import shutil
 import sys
 import time
 import warnings
+import psutil
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
@@ -56,7 +57,7 @@ from . import __version__
 from .configuration_utils import PretrainedConfig
 from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from .debug_utils import DebugOption, DebugUnderflowOverflow
-from .deepspeed import deepspeed_init, deepspeed_load_checkpoint
+from .deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_zero3_enabled
 from .dependency_versions_check import dep_version_check
 from .hyperparameter_search import ALL_HYPERPARAMETER_SEARCH_BACKENDS, default_hp_search_backend
 from .modelcard import TrainingSummary
@@ -212,7 +213,14 @@ if TYPE_CHECKING:
     import optuna
 
 logger = logging.get_logger(__name__)
-
+all_allocated = 0
+all_reserved = 0
+def get_memory_diff(src):
+    print(f"\033[36m{src}\033[0m")
+    print(f"\033[35mallocated: {torch.cuda.memory_allocated() // 1024 ** 2} MB\033[0m")
+    print(f"\033[35mreserved: {torch.cuda.memory_reserved() // 1024 ** 2} MB\033[0m")
+    #os.system('nvidia-smi -q -d MEMORY')
+    print("\033[94m----------------end------------------\033[0m")
 
 # Name of the files used for checkpointing
 TRAINING_ARGS_NAME = "training_args.bin"
@@ -688,9 +696,8 @@ class Trainer:
         self.can_return_loss = can_return_loss(self.model.__class__)
         self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
 
-        # Internal variables to help with automatic batch size reduction
+        # Internal variables to keep track of the original batch size
         self._train_batch_size = args.train_batch_size
-        self._created_lr_scheduler = False
 
         # very last
         self._memory_tracker.stop_and_update_metrics()
@@ -1151,7 +1158,6 @@ class Trainer:
                 num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
                 num_training_steps=num_training_steps,
             )
-            self._created_lr_scheduler = True
         return self.lr_scheduler
 
     def num_examples(self, dataloader: DataLoader) -> int:
@@ -1477,7 +1483,7 @@ class Trainer:
             ignore_keys_for_eval (`List[str]`, *optional*)
                 A list of keys in the output of your model (if it is a dictionary) that should be ignored when
                 gathering predictions for evaluation during the training.
-            kwargs (`Dict[str, Any]`, *optional*):
+            kwargs:
                 Additional keyword arguments used to hide deprecated arguments
         """
         if resume_from_checkpoint is False:
@@ -1614,27 +1620,16 @@ class Trainer:
             or is_sagemaker_mp_enabled()
             or self.fsdp is not None
         )
-
-        # We need to reset the scheduler, as its parameters may be different on subsequent calls
-        if self._created_lr_scheduler:
-            self.lr_scheduler = None
-            self._created_lr_scheduler = False
-
         if self.is_deepspeed_enabled:
             self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
-
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
-
         self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
-
         # Activate gradient checkpointing if needed
         if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
-
         model = self._wrap_model(self.model_wrapped)
-
         if is_sagemaker_mp_enabled() and resume_from_checkpoint is not None:
             self._load_from_checkpoint(resume_from_checkpoint, model)
 
@@ -1659,7 +1654,6 @@ class Trainer:
                 model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
                     self.model, self.optimizer, self.lr_scheduler
                 )
-
         if self.is_fsdp_enabled:
             self.model = model
 
@@ -1681,8 +1675,8 @@ class Trainer:
         # important: at this point:
         # self.model         is the Transformers Model
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
-
         # Train!
+        get_memory_diff('Start_training')
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {num_examples:,}")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
@@ -1758,6 +1752,7 @@ class Trainer:
                     break
 
         total_batched_samples = 0
+        get_memory_diff('Start_epoch')
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_iterator = train_dataloader
 
@@ -1784,7 +1779,9 @@ class Trainer:
                 rng_to_sync = True
 
             step = -1
+            get_memory_diff('Start_iteration')
             for step, inputs in enumerate(epoch_iterator):
+                print("\033[94mIteration = \033[0m", step)
                 total_batched_samples += 1
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
@@ -1806,7 +1803,9 @@ class Trainer:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
+                    get_memory_diff('Before_training_step')
                     tr_loss_step = self.training_step(model, inputs)
+                    get_memory_diff('After_training_step')
 
                 if (
                     args.logging_nan_inf_filter
@@ -1870,28 +1869,36 @@ class Trainer:
                             )
 
                     # Optimizer step
+
                     optimizer_was_run = True
                     if is_torch_tpu_available():
                         if self.do_grad_scaling:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
+
                         else:
                             # tpu-comment: accelerate wrapped optimizers call xm.optimizer_step
                             self.optimizer.step()
+
                     elif self.do_grad_scaling:
                         scale_before = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         scale_after = self.scaler.get_scale()
                         optimizer_was_run = scale_before <= scale_after
+
                     else:
+                        get_memory_diff('Before_optimizer_step')
                         self.optimizer.step()
+                        get_memory_diff('After_optimizer_step')
                         optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
 
                     if optimizer_was_run:
                         # Delay optimizer scheduling until metrics are generated
                         if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
+
+
 
                     model.zero_grad()
                     self.state.global_step += 1
@@ -2643,19 +2650,22 @@ class Trainer:
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
+        get_memory_diff('Before_train')
         model.train()
         inputs = self._prepare_inputs(inputs)
-
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
+        get_memory_diff('Before_loss')
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
+        get_memory_diff('After_loss')
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
+        get_memory_diff('Before_backward')
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -2663,8 +2673,20 @@ class Trainer:
                 scaled_loss.backward()
         else:
             self.accelerator.backward(loss)
+        get_memory_diff('After_backward')
 
         return loss.detach() / self.args.gradient_accumulation_steps
+
+    def create_hook_fn(module_name):
+        def print_intermediate_output(module, input, output):
+            if isinstance(output, tuple):
+                for tensor in output:
+                    if tensor is not None:
+                        intermediate_outputs.append((tensor, module_name))
+            else:
+                if output is not None:
+                    intermediate_outputs.append((output, module_name))
+        return print_intermediate_output
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -2672,16 +2694,21 @@ class Trainer:
 
         Subclass and override for custom behavior.
         """
+
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
             labels = None
+        get_memory_diff('Before_output')
         outputs = model(**inputs)
+        print(outputs['logits'].size())
+        print(outputs['logits'].type())
+        get_memory_diff('After_output')
+
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
-
         if labels is not None:
             if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
                 loss = self.label_smoother(outputs, labels, shift_labels=True)
@@ -2695,6 +2722,7 @@ class Trainer:
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            #loss = 0
 
         return (loss, outputs) if return_outputs else loss
 
@@ -2744,26 +2772,44 @@ class Trainer:
             or self.fsdp is not None
             or self.is_fsdp_enabled
         ):
-            state_dict = self.model.state_dict()
-            if self.args.should_save:
-                self._save(output_dir, state_dict=state_dict)
             if self.is_fsdp_enabled:
+                os.makedirs(output_dir, exist_ok=True)
                 save_fsdp_model(self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir)
+            else:
+                state_dict = self.model.state_dict()
 
-        elif self.is_deepspeed_enabled:
-            # this takes care of everything as long as we aren't under zero3
-            if version.parse(accelerate_version) <= version.parse("0.20.3"):
-                raise ValueError("Install Accelerate from main branch")
-            try:
-                state_dict = self.accelerator.get_state_dict(self.deepspeed)
                 if self.args.should_save:
                     self._save(output_dir, state_dict=state_dict)
-            except ValueError:
-                logger.warning(
-                    " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
-                    " zero_to_fp32.py to recover weights"
-                )
-                self.model_wrapped.save_checkpoint(output_dir)
+        elif self.is_deepspeed_enabled:
+            # this takes care of everything as long as we aren't under zero3
+            if self.args.should_save and not is_deepspeed_zero3_enabled():
+                if version.parse(accelerate_version) <= version.parse("0.20.3"):
+                    raise ValueError("Install Accelerate from main branch")
+                state_dict = self.accelerator.get_state_dict(self.deepspeed)
+
+                self._save(output_dir, state_dict=state_dict)
+
+            if is_deepspeed_zero3_enabled():
+                # It's too complicated to try to override different places where the weights dump gets
+                # saved, so since under zero3 the file is bogus, simply delete it. The user should
+                # either use deepspeed checkpoint to resume or to recover full weights use
+                # zero_to_fp32.py stored in the checkpoint.
+                if self.args.should_save:
+                    file = os.path.join(output_dir, WEIGHTS_NAME)
+                    if os.path.isfile(file):
+                        # logger.info(f"deepspeed zero3: removing {file}, see zero_to_fp32.py to recover weights")
+                        os.remove(file)
+
+                # now save the real model if stage3_gather_16bit_weights_on_model_save=True
+                # if false it will not be saved.
+                # This must be called on all ranks
+                if not self.model_wrapped.save_16bit_model(output_dir, WEIGHTS_NAME):
+                    logger.warning(
+                        "deepspeed.save_16bit_model didn't save the model, since"
+                        " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
+                        " zero_to_fp32.py to recover weights"
+                    )
+                    self.model_wrapped.save_checkpoint(output_dir)
 
         elif self.args.should_save:
             self._save(output_dir)
@@ -3131,9 +3177,9 @@ class Trainer:
                 losses = self.accelerator.gather_for_metrics((loss.repeat(batch_size)))
                 losses_host = losses if losses_host is None else nested_concat(losses_host, losses, padding_index=-100)
             if labels is not None:
-                labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                labels = self.accelerator.pad_across_processes(labels)
             if inputs_decode is not None:
-                inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
+                inputs_decode = self.accelerator.pad_across_processes(inputs_decode)
                 inputs_decode = self.accelerator.gather_for_metrics((inputs_decode))
                 inputs_host = (
                     inputs_decode
@@ -3141,7 +3187,7 @@ class Trainer:
                     else nested_concat(inputs_host, inputs_decode, padding_index=-100)
                 )
             if logits is not None:
-                logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
+                logits = self.accelerator.pad_across_processes(logits)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 logits = self.accelerator.gather_for_metrics((logits))
@@ -3154,7 +3200,7 @@ class Trainer:
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if args.eval_accumulation_steps is not None and self.accelerator.sync_gradients:
+            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
                 if losses_host is not None:
                     losses = nested_numpify(losses_host)
                     all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
@@ -3183,19 +3229,13 @@ class Trainer:
 
         # Gather all remaining tensors and put them back on the CPU
         if losses_host is not None:
-            losses = nested_numpify(losses_host)
-            all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+            all_losses = nested_numpify(losses_host)
         if preds_host is not None:
-            logits = nested_numpify(preds_host)
-            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+            all_preds = nested_numpify(preds_host)
         if inputs_host is not None:
-            inputs_decode = nested_numpify(inputs_host)
-            all_inputs = (
-                inputs_decode if all_inputs is None else nested_concat(all_inputs, inputs_decode, padding_index=-100)
-            )
+            all_inputs = nested_numpify(inputs_host)
         if labels_host is not None:
-            labels = nested_numpify(labels_host)
-            all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+            all_labels = nested_numpify(labels_host)
 
         # Number of samples
         if has_length(eval_dataset):
@@ -3256,6 +3296,41 @@ class Trainer:
         ):
             tensors = distributed_concat(tensors)
         return tensors
+
+    # Copied from Accelerate.
+    def _pad_across_processes(self, tensor, pad_index=-100):
+        """
+        Recursively pad the tensors in a nested list/tuple/dictionary of tensors from all devices to the same size so
+        they can safely be gathered.
+        """
+        if isinstance(tensor, (list, tuple)):
+            return type(tensor)(self._pad_across_processes(t, pad_index=pad_index) for t in tensor)
+        elif isinstance(tensor, dict):
+            return type(tensor)({k: self._pad_across_processes(v, pad_index=pad_index) for k, v in tensor.items()})
+        elif not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"Can't pad the values of type {type(tensor)}, only of nested list/tuple/dicts of tensors."
+            )
+
+        if len(tensor.shape) < 2:
+            return tensor
+        # Gather all sizes
+        size = torch.tensor(tensor.shape, device=tensor.device)[None]
+        sizes = self._nested_gather(size).cpu()
+
+        max_size = max(s[1] for s in sizes)
+        # When extracting XLA graphs for compilation, max_size is 0,
+        # so use inequality to avoid errors.
+        if tensor.shape[1] >= max_size:
+            return tensor
+
+        # Then pad to the maximum size
+        old_size = tensor.shape
+        new_size = list(old_size)
+        new_size[1] = max_size
+        new_tensor = tensor.new_zeros(tuple(new_size)) + pad_index
+        new_tensor[:, : old_size[1]] = tensor
+        return new_tensor
 
     def prediction_step(
         self,
@@ -3539,7 +3614,7 @@ class Trainer:
                 Message to commit while pushing.
             blocking (`bool`, *optional*, defaults to `True`):
                 Whether the function should return only when the `git push` has finished.
-            kwargs (`Dict[str, Any]`, *optional*):
+            kwargs:
                 Additional keyword arguments passed along to [`~Trainer.create_model_card`].
 
         Returns:
@@ -3814,10 +3889,8 @@ class Trainer:
         # post accelerator creation setup
         if self.is_fsdp_enabled:
             fsdp_plugin = self.accelerator.state.fsdp_plugin
-            fsdp_plugin.limit_all_gathers = self.args.fsdp_config.get(
-                "limit_all_gathers", fsdp_plugin.limit_all_gathers
-            )
-            fsdp_plugin.use_orig_params = self.args.fsdp_config.get("use_orig_params", fsdp_plugin.use_orig_params)
+            fsdp_plugin.limit_all_gathers = self.args.fsdp_config.get("limit_all_gathers", False)
+            fsdp_plugin.use_orig_params = self.args.fsdp_config.get("use_orig_params", False)
 
         if self.is_deepspeed_enabled:
             if getattr(self.args, "hf_deepspeed_config", None) is None:
