@@ -37,8 +37,12 @@ from .configuration_llama import LlamaConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
-
-
+all_memory = 0
+def look_memory(arc):
+    global all_memory
+    now_memory = torch.cuda.memory_allocated()
+    print(arc, " change:", (now_memory - all_memory) // 1024, "KB all:", now_memory // 1024, "KB")
+    all_memory = now_memory
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
     input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
@@ -213,7 +217,14 @@ class LlamaMLP(nn.Module):
             down_proj = [F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.pretraining_tp)]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            y1 = self.gate_proj(x)
+            look_memory("gate:")
+            y1 = self.act_fn(y1)
+            look_memory("act:")
+            y2 = self.up_proj(x)
+            look_memory("up:")
+            down_proj = self.down_proj(y1 * y2)
+            look_memory("down:")
 
         return down_proj
 
@@ -303,9 +314,11 @@ class LlamaAttention(nn.Module):
 
         else:
             query_states = self.q_proj(hidden_states)
+            look_memory("q:")
             key_states = self.k_proj(hidden_states)
+            look_memory("k:")
             value_states = self.v_proj(hidden_states)
-        print("lllllllllllllllllllllloooooooooooooooooooooooooooooooooooooooooook")
+            look_memory("v:")
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -328,7 +341,7 @@ class LlamaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+        look_memory("q*k:")
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -345,6 +358,7 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        look_memory("v2:")
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -361,7 +375,7 @@ class LlamaAttention(nn.Module):
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)
-
+        look_memory("o:")
         if not output_attentions:
             attn_weights = None
 
@@ -399,11 +413,11 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-
+        look_memory("forward start:")
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
+        look_memory("RSMNorm1 :")
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -418,6 +432,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        look_memory("RSMNorm2 :")
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -666,7 +681,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-
+        print("before decoder-layers:",torch.cuda.memory_allocated())
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
