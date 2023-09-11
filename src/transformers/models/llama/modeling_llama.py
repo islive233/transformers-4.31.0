@@ -656,9 +656,10 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
+        look_memory("before_first_embed:")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        look_memory("after_first_embed:")
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
