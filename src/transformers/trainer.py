@@ -2700,7 +2700,8 @@ class Trainer:
         else:
             labels = None
         get_memory_diff('Before_output')
-        print(inputs
+        print(inputs)
+        print(inputs['input_ids'].size())
         outputs = model(**inputs)
         print(outputs['logits'].size())
         print(outputs['logits'].type())
